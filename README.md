@@ -261,6 +261,7 @@ Everything is optional; defaults work out of the box. Edit via the Web card or a
 | `rewriteImages` | `true` | rewrite image blocks in the model input (cached description or tool-hint marker); the UI log keeps images |
 | `downscale` / `downscaleMaxPixels` | `true` / `4000000` | pre-call downscale and its pixel budget (latency guard) |
 | `cache` / `cacheTtlSeconds` / `cacheMaxEntries` | `true` / `3600` / `200` | vision answer cache |
+| `visionContext` | `false` | continuous vision context: repeated looks at the same image append the previous result to the next prompt (zero extra calls); off by default |
 | `timeoutMs` | `120000` | per vision call deadline |
 | `artifactsDir` | `.dsh-vision-router/artifacts` | artifact directory (relative to the session workspace) |
 | `proxy` / `proxyHosts` | `''` / openrouter hosts | optional proxy for vision provider hosts only |

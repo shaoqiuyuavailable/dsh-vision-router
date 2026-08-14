@@ -23,6 +23,9 @@ import {
   renderVisionPresent,
   extractJson,
   createCache,
+  visionImageKey,
+  createVisionContextMemory,
+  augmentVisionInstruction,
   downscaleImage,
   toOpenAIContent,
   toRealPath,
@@ -1212,6 +1215,45 @@ test('the vision chain ships with the built-in free model as its first row', () 
   assert.deepEqual(Config({}).providers, [
     { provider: 'vision-http', model: 'ovh/Qwen3.5-397B-A17B', fallbacks: [] },
   ])
+})
+
+test('visionContext defaults to false (no hidden extra prompt tokens)', () => {
+  assert.equal(Config({}).visionContext, false)
+})
+
+test('visionImageKey hashes bytes deterministically and distinguishes content', () => {
+  assert.equal(visionImageKey(Buffer.from('image-a')), visionImageKey(Buffer.from('image-a')))
+  assert.notEqual(visionImageKey(Buffer.from('image-a')), visionImageKey(Buffer.from('image-b')))
+})
+
+test('vision context memory keeps the latest result and evicts LRU', () => {
+  const mem = createVisionContextMemory(2)
+  assert.equal(mem.get('missing'), undefined)
+  mem.set('a', 'first')
+  mem.set('b', 'second')
+  mem.set('c', 'third')
+  assert.equal(mem.get('a'), undefined) // evicted
+  assert.equal(mem.get('b'), 'second')
+  assert.equal(mem.get('c'), 'third')
+  mem.set('b', 'second-v2') // refresh insertion order
+  mem.set('d', 'fourth')
+  assert.equal(mem.get('c'), undefined) // c is the oldest now
+  assert.equal(mem.get('b'), 'second-v2')
+  mem.set('e', '   ') // empty values are ignored
+  assert.equal(mem.get('e'), undefined)
+})
+
+test('augmentVisionInstruction wraps the previous result and slices it', () => {
+  assert.equal(augmentVisionInstruction(undefined, 'Q'), 'Q')
+  assert.equal(augmentVisionInstruction('   ', 'Q'), 'Q')
+  const out = augmentVisionInstruction('the previous answer', 'what next?')
+  assert.ok(out.includes('the previous answer'))
+  assert.ok(out.includes('what next?'))
+  assert.ok(out.includes('本次任务'))
+  const long = 'x'.repeat(5000)
+  const sliced = augmentVisionInstruction(long, 'Q', 1200)
+  assert.ok(sliced.includes('x'.repeat(1200)))
+  assert.ok(!sliced.includes('x'.repeat(1201)))
 })
 
 test('keep-alive fallback: stealth off + dead stock route still serves deepseek-official', async () => {

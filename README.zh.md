@@ -261,6 +261,7 @@ Web 配置页在 **设置 → 插件 → 插件配置** 下注册「视觉路由
 | `rewriteImages` | `true` | 模型输入层改写图片块（缓存描述或工具提示标记）；界面日志保留图片 |
 | `downscale` / `downscaleMaxPixels` | `true` / `4000000` | 调用前压缩及其像素预算（延迟保护） |
 | `cache` / `cacheTtlSeconds` / `cacheMaxEntries` | `true` / `3600` / `200` | 视觉答案缓存 |
+| `visionContext` | `false` | 连续识图上下文：同一张图再次识图时把上一轮结果附进新的提示词（零额外调用）；默认关闭 |
 | `timeoutMs` | `120000` | 单次视觉调用超时 |
 | `artifactsDir` | `.dsh-vision-router/artifacts` | 产物目录（相对会话工作区） |
 | `proxy` / `proxyHosts` | `''` / openrouter 域名 | 仅视觉供应商域名可选的本地代理 |
