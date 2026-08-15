@@ -2974,9 +2974,6 @@ export function apply(ctx, config = {}) {
               `vision_describe: image ${path} was rejected (${error && error.message ? error.message : String(error)})`,
             )
           }
-          if (contextHash !== undefined && stored.data && stored.data.length > 0) {
-            contextHash.update(stored.data)
-          }
           contentIds.push(String(ref.attachmentId))
           blocks.push({ type: 'image', attachment: ref })
         }
@@ -3017,6 +3014,9 @@ export function apply(ctx, config = {}) {
                 stored = { ...stored, data: resized }
               }
             }
+          }
+          if (contextHash !== undefined && stored.data && stored.data.length > 0) {
+            contextHash.update(stored.data)
           }
           contentIds.push(String(ref.attachmentId))
           blocks.push({ type: 'image', attachment: stored.ref })

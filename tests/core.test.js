@@ -1047,7 +1047,7 @@ test('stealth stream keeps the log intact and hands the model a tool-hint marker
 function mockHarnessCtx({ stockRoute = false, config0 = {}, skills = false } = {}) {
   const adapters = new Map() // provider -> adapter
   const registrations = new Map() // provider -> { adapter, retryPolicy }
-  const captured = { skills: [], on: new Map() }
+  const captured = { skills: [], tools: [], on: new Map(), fsBytes: null }
   if (stockRoute) {
     const stock = {
       providerInfo: (p) => ({ id: p, name: 'DeepSeek' }),
@@ -1066,6 +1066,7 @@ function mockHarnessCtx({ stockRoute = false, config0 = {}, skills = false } = {
     adapters.set('deepseek-official', stock)
     registrations.set('deepseek-official', { adapter: stock, retryPolicy: 'retry' })
   }
+  const attachmentStore = { last: undefined }
   const ctx = {
     get(name) {
       if (name === 'settings') return { get: () => undefined }
@@ -1076,6 +1077,24 @@ function mockHarnessCtx({ stockRoute = false, config0 = {}, skills = false } = {
             captured.skills.push(skill)
             return () => {}
           },
+        }
+      }
+      if (name === 'attachments') {
+        return {
+          saveImage: async (input) => {
+            attachmentStore.last = { data: input.data, mediaType: input.mediaType }
+            return { attachmentId: 'att-1', name: 'x.png', mediaType: input.mediaType }
+          },
+          readImage: async () => ({
+            ref: { attachmentId: 'att-1', name: 'x.png' },
+            data: attachmentStore.last && attachmentStore.last.data,
+          }),
+        }
+      }
+      if (name === 'fs') {
+        return {
+          resolve: async () => ({}),
+          readBytes: async () => captured.fsBytes,
         }
       }
       return undefined
@@ -1101,8 +1120,17 @@ function mockHarnessCtx({ stockRoute = false, config0 = {}, skills = false } = {
       }
       callback(sctx)
     },
-    tools: { register: () => () => {} },
+    tools: {
+      register: (definition) => {
+        captured.tools.push(definition)
+        return () => {}
+      },
+    },
     llm: {
+      resolveModelInfo: async (provider, model) => ({
+        provider, id: model, name: model, inputModalities: ['text', 'image'],
+        context: { contextWindow: 128000 },
+      }),
       registerAdapter(providers, adapter) {
         for (const provider of providers) {
           if (adapters.has(provider)) {
@@ -1254,6 +1282,102 @@ test('augmentVisionInstruction wraps the previous result and slices it', () => {
   const sliced = augmentVisionInstruction(long, 'Q', 1200)
   assert.ok(sliced.includes('x'.repeat(1200)))
   assert.ok(!sliced.includes('x'.repeat(1201)))
+})
+
+test('vision_describe end-to-end: visionContext reuses the previous result for the same image', async () => {
+  const { ctx, captured } = mockHarnessCtx({ config0: { visionContext: true } })
+  const png = await sharp({
+    create: { width: 8, height: 8, channels: 3, background: '#ffffff' },
+  })
+    .png()
+    .toBuffer()
+  captured.fsBytes = png
+  // a registered image-capable provider so resolveToolVisionPairs finds a
+  // usable adapter-backed pair (the vision-http route is intentionally
+  // excluded from the tool chain and would fall through to a real network)
+  const backend = {
+    providerInfo: (p) => ({ id: p, name: 'Opencode' }),
+    providerRetryPolicy: () => 'retry',
+    listModels: async (p) => [
+      { provider: p, id: 'm1', name: 'M1', inputModalities: ['text', 'image'] },
+    ],
+    resolveModel: async (p, m) => ({
+      provider: p, id: m, name: m, inputModalities: ['text', 'image'], context: { contextWindow: 100000 },
+    }),
+    stream: async function* () {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  ctx.llm.registerAdapter(['opencode-go'], backend)
+  ctx.llm.listProviders = () => [{ id: 'opencode-go' }]
+  apply(ctx, Config({ visionContext: true }))
+  // progressive mode: mount the deep tools through the bootstrap tool
+  const activate = captured.tools.find((tool) => tool.name === 'vision_activate')
+  assert.ok(activate, 'expected the vision_activate bootstrap registration')
+  await activate.execute()
+  const describe = captured.tools.find((tool) => tool.name === 'vision_describe')
+  assert.ok(describe, 'expected the vision_describe registration after activation')
+  const calls = []
+  ctx.llm.stream = async function* (options) {
+    calls.push(options)
+    const text = calls.length === 1 ? '第一轮结果：8x8 白色图片' : '第二轮结果：更具体'
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const exec = { agent: { session: { header: { cwd: '/tmp' } } } }
+  const first = await describe.execute({ paths: ['/tmp/x.png'], question: '这是什么' }, exec)
+  assert.ok(String(first).includes('第一轮结果'), String(first))
+  const second = await describe.execute({ paths: ['/tmp/x.png'], question: '再具体一点' }, exec)
+  assert.ok(String(second).includes('第二轮结果'), String(second))
+  // the second prompt carries the first result as context; the first does not
+  const promptOf = (options) => JSON.stringify(options.messages)
+  assert.ok(!promptOf(calls[0]).includes('同一张图的上一轮识别结果'))
+  const secondPrompt = promptOf(calls[1])
+  assert.ok(secondPrompt.includes('同一张图的上一轮识别结果'))
+  assert.ok(secondPrompt.includes('第一轮结果'))
+})
+
+test('vision_describe end-to-end: visionContext off leaves the prompt untouched', async () => {
+  const { ctx, captured } = mockHarnessCtx()
+  const png = await sharp({
+    create: { width: 8, height: 8, channels: 3, background: '#ffffff' },
+  })
+    .png()
+    .toBuffer()
+  captured.fsBytes = png
+  const backend = {
+    providerInfo: (p) => ({ id: p, name: 'Opencode' }),
+    providerRetryPolicy: () => 'retry',
+    listModels: async (p) => [
+      { provider: p, id: 'm1', name: 'M1', inputModalities: ['text', 'image'] },
+    ],
+    resolveModel: async (p, m) => ({
+      provider: p, id: m, name: m, inputModalities: ['text', 'image'], context: { contextWindow: 100000 },
+    }),
+    stream: async function* () {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  ctx.llm.registerAdapter(['opencode-go'], backend)
+  ctx.llm.listProviders = () => [{ id: 'opencode-go' }]
+  apply(ctx, Config({}))
+  const activate = captured.tools.find((tool) => tool.name === 'vision_activate')
+  await activate.execute()
+  const describe = captured.tools.find((tool) => tool.name === 'vision_describe')
+  const calls = []
+  ctx.llm.stream = async function* (options) {
+    calls.push(options)
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'answer' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const exec = { agent: { session: { header: { cwd: '/tmp' } } } }
+  await describe.execute({ paths: ['/tmp/x.png'], question: '这是什么' }, exec)
+  await describe.execute({ paths: ['/tmp/x.png'], question: '再具体一点' }, exec)
+  assert.ok(!JSON.stringify(calls[1].messages).includes('同一张图的上一轮识别结果'))
 })
 
 test('keep-alive fallback: stealth off + dead stock route still serves deepseek-official', async () => {
