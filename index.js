@@ -2050,11 +2050,13 @@ export function imageMemorySet(map, id, description) {
 
 /**
  * dsh-vision 并入：即时本地翻译。
- * 对模型输入里的图片块（按附件 id 去重）调用本地 Ollama 识别，返回
- * `attachmentId -> 识别文本` 映射。任何失败（Ollama 未开、超时、空结果）
- * 都返回空 Map——调用方回退为静态工具提示标记，绝不阻塞图片轮。
+ * 对模型输入里的图片块（按附件 id 去重、跳过跨轮记忆已收录的图）调用
+ * 本地视觉后端识别，返回 `attachmentId -> 识别文本` 映射。任何失败
+ * （后端未开、超时、空结果）都不阻塞图片轮——调用方回退为静态工具提示
+ * 标记。
  * `options.style` 选择识别提示风格；`options.memory`（imageMemory）在识别
  * 成功后写回纯文本，使同图后续轮次直接命中缓存描述（跨轮图片记忆）。
+ * 多图按批并行（每批 ≤3，显存受限），单张失败只丢那张；每批独立预算。
  */
 export async function buildInstantLocalMap(ctx, messages, provider, options = {}) {
   const map = new Map()
@@ -2071,6 +2073,10 @@ export async function buildInstantLocalMap(ctx, messages, provider, options = {}
       const id = attachment.attachmentId || attachment.id || ''
       if (id === '' || seen.has(id)) continue
       seen.add(id)
+      // 跨轮记忆已收录的图直接跳过：改写路径优先读 memory（见
+      // createWrapperStreamBody / rewriteHistoryImages），再识别一次纯属
+      // 浪费——长会话里每个图片轮都会把整段历史的图重新发一遍。
+      if (memory !== undefined && memory.has(id)) continue
       blocks.push({ block, id })
     }
   }
@@ -2083,68 +2089,81 @@ export async function buildInstantLocalMap(ctx, messages, provider, options = {}
   }
   if (!attachments || typeof attachments.readImage !== 'function') return map
   const prompt = localDescribePrompt(style)
-  // 独立超时（默认 120s）：Ollama 挂起（连接建立但响应缓慢）时不能拖住整个
-  // 图片轮——AbortSignal.timeout 与调用方 signal 组合，任一触发即中止。
+  // 每批独立超时（默认 120s）：后端挂起（连接建立但响应缓慢）时不能拖住
+  // 整个图片轮。用 AbortController + setTimeout 而不是 AbortSignal.timeout
+  // ——后者创建的计时器在调用完成后不会被取消，长驻进程里每个图片轮都会
+  // 留下一个 120s 的空转定时器；且整批共享一个超时信号会让第一批挂起就
+  // 吃掉全部预算，后续批次一张都轮不到。
   const budgetMs =
     Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 120000
-  const signal =
-    options.signal !== undefined
-      ? AbortSignal.any([options.signal, AbortSignal.timeout(budgetMs)])
-      : AbortSignal.timeout(budgetMs)
+  let failed = 0
   try {
-    // 多图并行识别：Ollama 本地推理受显存限制，不能无脑全并发——按
+    // 多图并行识别：本地推理受显存限制，不能无脑全并发——按
     // 3 张一批并行（批间串行），一次贴 N 张图总耗时 ≈ ⌈N/3⌉ × 单张。
     // 单张失败只丢那张（记录日志），其余照常识别，不再"一张坏图拖垮整批"。
     const CONCURRENT = 3
     for (let start = 0; start < blocks.length; start += CONCURRENT) {
       const batch = blocks.slice(start, start + CONCURRENT)
-      const outcomes = await Promise.all(
-        batch.map(async ({ block, id }) => {
-          try {
-            const startedAt = Date.now()
-            const stored = await attachments.readImage(block.attachment, signal)
-            const content = toOpenAIContent([block], () => stored.data)
-            content.push({ type: 'text', text: prompt })
-            const text = await callOpenAICompatible(
-              provider,
-              [{ role: 'user', content }],
-              { maxTokens: provider.maxTokens ?? 2048, signal },
-            )
-            return { id, ok: true, text, elapsedMs: Date.now() - startedAt }
-          } catch (error) {
-            return {
-              id,
-              ok: false,
-              error: error && error.message ? error.message : String(error),
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), budgetMs)
+      const signal =
+        options.signal !== undefined
+          ? AbortSignal.any([options.signal, controller.signal])
+          : controller.signal
+      try {
+        const outcomes = await Promise.all(
+          batch.map(async ({ block, id }) => {
+            try {
+              const startedAt = Date.now()
+              const stored = await attachments.readImage(block.attachment, signal)
+              const content = toOpenAIContent([block], () => stored.data)
+              content.push({ type: 'text', text: prompt })
+              const text = await callOpenAICompatible(
+                provider,
+                [{ role: 'user', content }],
+                { maxTokens: provider.maxTokens ?? 2048, signal },
+              )
+              return { id, ok: true, text, elapsedMs: Date.now() - startedAt }
+            } catch (error) {
+              return {
+                id,
+                ok: false,
+                error: error && error.message ? error.message : String(error),
+              }
             }
-          }
-        }),
-      )
-      for (const outcome of outcomes) {
-        if (outcome.ok) {
-          if (typeof outcome.text === 'string' && outcome.text.trim() !== '') {
-            const elapsedSec = Math.max(1, Math.round(outcome.elapsedMs / 1000))
-            const plain = outcome.text.trim()
-            map.set(
+          }),
+        )
+        for (const outcome of outcomes) {
+          if (outcome.ok) {
+            if (typeof outcome.text === 'string' && outcome.text.trim() !== '') {
+              const elapsedSec = Math.max(1, Math.round(outcome.elapsedMs / 1000))
+              const plain = outcome.text.trim()
+              map.set(
+                outcome.id,
+                `已由本地视觉识别（本地识别 ${elapsedSec}s）\n${plain}`,
+              )
+              if (memory !== undefined) imageMemorySet(memory, outcome.id, plain)
+            }
+          } else {
+            failed += 1
+            ctx.logger?.warn(
+              'vision-router: instant local describe failed for image %s: %s',
               outcome.id,
-              `已由本地视觉识别（本地识别 ${elapsedSec}s）\n${plain}`,
+              outcome.error,
             )
-            if (memory !== undefined) imageMemorySet(memory, outcome.id, plain)
           }
-        } else {
-          ctx.logger?.warn(
-            'vision-router: instant local describe failed for image %s: %s',
-            outcome.id,
-            outcome.error,
-          )
         }
+      } finally {
+        clearTimeout(timer)
       }
     }
     // 排障可见性：成功与失败都进宿主日志（含 v1.3.0 的持久化诊断日志）。
     ctx.logger?.info(
-      'vision-router: instant local describe recognized %d/%d image(s)',
+      'vision-router: instant local describe recognized %d/%d image(s), %d cached from memory, %d failed',
       map.size,
       blocks.length,
+      seen.size - blocks.length,
+      failed,
     )
   } catch (error) {
     // 保底：批处理之外的意外整体失败（正常不会走到这里——每张图已在
@@ -2463,6 +2482,16 @@ export function apply(ctx, config = {}) {
   const timeoutMs = () => {
     const value = current().timeoutMs
     return Number.isFinite(value) && value > 0 ? value : 120000
+  }
+  // 每次 provider 尝试独立预算（timeoutMs）：挂起的 provider（比如排最前
+  // 的本地后端只挂连接不响应）最多占用一个预算，之后继续尝试下一个。
+  // 整链共享一个超时信号会让第一个挂起的 provider 吃掉全部预算，后面的
+  // 云端兜底一次真实尝试都拿不到。计时器在 finally 清理，不用
+  // AbortSignal.timeout（其计时器完成后不取消，长驻进程里会悬挂）。
+  const runAttempt = (run) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs())
+    return run(controller.signal).finally(() => clearTimeout(timer))
   }
   const routingEnabled = () => current().routing !== false
   const reverseRoutingEnabled = () => routingEnabled() && current().reverseRouting !== false
@@ -4079,19 +4108,20 @@ export function apply(ctx, config = {}) {
             source: { kind: 'plugin', plugin: 'dsh-vision-router' },
           },
         ]
-        const signal = AbortSignal.timeout(timeoutMs())
         const errors = [...rejectedPairs]
 
         for (const pair of usablePairs) {
           try {
             let messages = baseMessages
-            let text = await visionAnswer(ctx.llm, {
-              provider: pair.provider,
-              model: pair.model,
-              messages,
-              maxTokens: 4096,
-              signal,
-            })
+            let text = await runAttempt((attemptSignal) =>
+              visionAnswer(ctx.llm, {
+                provider: pair.provider,
+                model: pair.model,
+                messages,
+                maxTokens: 4096,
+                signal: attemptSignal,
+              }),
+            )
             if (wantJson) {
               for (let attempt = 0; attempt < 2; attempt++) {
                 const parsed = extractJson(text)
@@ -4114,13 +4144,15 @@ export function apply(ctx, config = {}) {
                       source: { kind: 'plugin', plugin: 'dsh-vision-router' },
                     },
                   ]
-                  text = await visionAnswer(ctx.llm, {
-                    provider: pair.provider,
-                    model: pair.model,
-                    messages,
-                    maxTokens: 4096,
-                    signal,
-                  })
+                  text = await runAttempt((attemptSignal) =>
+                    visionAnswer(ctx.llm, {
+                      provider: pair.provider,
+                      model: pair.model,
+                      messages,
+                      maxTokens: 4096,
+                      signal: attemptSignal,
+                    }),
+                  )
                 }
               }
               const fallback = `vision_describe: the model did not produce valid JSON. Raw output:\n${text.slice(0, 2000)}`
@@ -4163,7 +4195,7 @@ export function apply(ctx, config = {}) {
               [{ role: 'user', content: openAIBlocks }],
               promptText,
             ).messages
-            const askHttp = async (correction) => {
+            const askHttp = async (correction, attemptSignal) => {
               const answer = await callOpenAICompatible(
                 provider,
                 correction === undefined
@@ -4172,11 +4204,11 @@ export function apply(ctx, config = {}) {
                       ...openAIBaseMessages,
                       { role: 'user', content: [{ type: 'text', text: correction }] },
                     ],
-                { maxTokens: provider.maxTokens ?? 4096, signal, resolveCredential },
+                { maxTokens: provider.maxTokens ?? 4096, signal: attemptSignal, resolveCredential },
               )
               return answer
             }
-            let text = await askHttp(undefined)
+            let text = await runAttempt((attemptSignal) => askHttp(undefined, attemptSignal))
             if (wantJson) {
               for (let attempt = 0; attempt < 2; attempt++) {
                 const parsed = extractJson(text)
@@ -4186,8 +4218,11 @@ export function apply(ctx, config = {}) {
                   return compact
                 }
                 if (attempt === 0) {
-                  text = await askHttp(
-                    'That output was not valid JSON. Respond with ONLY a valid JSON object now.',
+                  text = await runAttempt((attemptSignal) =>
+                    askHttp(
+                      'That output was not valid JSON. Respond with ONLY a valid JSON object now.',
+                      attemptSignal,
+                    ),
                   )
                 }
               }
@@ -4339,7 +4374,6 @@ export function apply(ctx, config = {}) {
     const answerVision = async (imageBytes, mediaType, instruction) => {
       const errors = []
       const block = await visionBlocksFromBytes(imageBytes, mediaType)
-      const signal = AbortSignal.timeout(timeoutMs())
       const usablePairs = await resolveToolVisionPairs()
       const pairCapabilities = new Map()
       for (const pair of pairs()) {
@@ -4368,15 +4402,17 @@ export function apply(ctx, config = {}) {
           pairCapabilities.set(pairKey, pairCapability)
         }
         try {
-          const text = await visionAnswer(ctx.llm, {
-            provider: pair.provider,
-            model: pair.model,
-            messages: [
-              { role: 'user', content: [block, { type: 'text', text: instruction }] },
-            ],
-            maxTokens: 4096,
-            signal,
-          })
+          const text = await runAttempt((attemptSignal) =>
+            visionAnswer(ctx.llm, {
+              provider: pair.provider,
+              model: pair.model,
+              messages: [
+                { role: 'user', content: [block, { type: 'text', text: instruction }] },
+              ],
+              maxTokens: 4096,
+              signal: attemptSignal,
+            }),
+          )
           if (text && text.trim() !== '') return { text: text.trim() }
         } catch (error) {
           // Channels whose catalog does not declare image input reject images
@@ -4387,12 +4423,14 @@ export function apply(ctx, config = {}) {
           const capability = pairCapabilities.get(`${pair.provider}/${pair.model}`)
           if (capability && capability.inferred) {
             try {
-              const direct = await directChannelVisionAnswer(
-                pair.provider,
-                pair.model,
-                [block],
-                instruction,
-                signal,
+              const direct = await runAttempt((attemptSignal) =>
+                directChannelVisionAnswer(
+                  pair.provider,
+                  pair.model,
+                  [block],
+                  instruction,
+                  attemptSignal,
+                ),
               )
               if (direct && direct.trim() !== '') return { text: direct.trim() }
             } catch (bridgeError) {
@@ -4410,10 +4448,12 @@ export function apply(ctx, config = {}) {
         try {
           const stored = await ctx.get('attachments').readImage(block.attachment)
           const content = toOpenAIContent([block], () => stored.data)
-          const text = await callOpenAICompatible(
-            provider,
-            [{ role: 'user', content: [...content, { type: 'text', text: instruction }] }],
-            { maxTokens: provider.maxTokens ?? 4096, signal, resolveCredential },
+          const text = await runAttempt((attemptSignal) =>
+            callOpenAICompatible(
+              provider,
+              [{ role: 'user', content: [...content, { type: 'text', text: instruction }] }],
+              { maxTokens: provider.maxTokens ?? 4096, signal: attemptSignal, resolveCredential },
+            ),
           )
           if (text && text.trim() !== '') return { text: text.trim() }
         } catch (error) {
@@ -5184,6 +5224,10 @@ export function apply(ctx, config = {}) {
             const local = localProvidersOf(current())[0]
             if (local !== undefined) {
               const startedAt = Date.now()
+              // 自建可取消超时（同 buildInstantLocalMap）：AbortSignal.timeout
+              // 的计时器完成后不清理，会留一个 timeoutMs 的空转定时器。
+              const identifyController = new AbortController()
+              const identifyTimer = setTimeout(() => identifyController.abort(), timeoutMs())
               try {
                 // 识别前降采样：全屏 PNG 可达数 MB（4K 屏 / 多显示器虚拟屏），
                 // 原样 base64 直送会拖慢识别甚至超出视觉模型分辨率上限。
@@ -5216,7 +5260,7 @@ export function apply(ctx, config = {}) {
                 const identified = await callOpenAICompatible(
                   local,
                   [{ role: 'user', content }],
-                  { maxTokens: local.maxTokens ?? 2048, signal: AbortSignal.timeout(timeoutMs()) },
+                  { maxTokens: local.maxTokens ?? 2048, signal: identifyController.signal },
                 )
                 result.identified = identified.trim()
                 result.elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000))
@@ -5229,6 +5273,8 @@ export function apply(ctx, config = {}) {
               } catch (error) {
                 result.identifyError =
                   error && error.message ? error.message : String(error)
+              } finally {
+                clearTimeout(identifyTimer)
               }
             } else {
               result.identifyError = 'no local vision backend enabled (localOllama / localLmStudio); enable one to use identify'
