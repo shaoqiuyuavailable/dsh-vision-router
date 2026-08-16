@@ -179,7 +179,6 @@ test('the settings card skips offscreen paint and rebuilds model options once', 
   assert.equal(source.includes('inject: () => cardInject'), true)
 })
 
-
 test('empty vision dropdown diagnostics identify undeclared image models and support re-detection', () => {
   const bundle = loadClientBundle()
   const groups = [
@@ -219,4 +218,33 @@ test('toolview cards use a non-default priority so other vision plugins can coex
   // while coexisting with plugins that use the default priority 0.
   assert.equal(source.includes("key: 'vision_present', priority: -10"), true)
   assert.equal(source.includes("key, priority: -10, inject"), true)
+})
+
+test('the vision-backend override editor mirrors the chain rows with two selects', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  // The extraVisionModels setting is rendered as the same two-select row
+  // shape as the vision backend chain: a provider select (providers with
+  // excluded models) and a model select (that provider's excluded models).
+  assert.equal(source.includes("extraVisionModels: 'extraVisionModelsLabel'"), true)
+  assert.equal(source.includes("extraVisionModels: 'extraVisionModelsHint'"), true)
+  assert.equal(source.includes('const extraVisionModelsEditor = () => {'), true)
+  assert.equal(source.includes('const hiddenProviders = useMemo('), true)
+  assert.equal(source.includes('hiddenVisionBackends.map((entry) => entry.provider)'), true)
+  assert.equal(source.includes('hiddenModelsOf.get(row.provider) ?? []'), true)
+  assert.equal(source.includes("t('pickProviderFirst')"), true)
+  // The editor drafts an array; the free-text fallback stays for when no
+  // hidden models / no catalog is available.
+  assert.equal(source.includes("textField('extraVisionModels', t('extraVisionModelsLabel'), t('extraVisionModelsHint'), true)"), true)
+  assert.equal(source.includes('Array.isArray(text)'), true)
+  // Saving the override refreshes the capability map silently (no loading
+  // flash / apparent page refresh).
+  assert.equal(source.includes("plan.some((item) => item.key === 'extraVisionModels')"), true)
+  assert.equal(source.includes('loadVisionCapabilities(true, true)'), true)
+  // The capability notice reflects name-based / manual recognition.
+  assert.equal(source.includes('or are recognized as vision models by name / manual override'), true)
+  // The hidden-models panel points at the override editor.
+  assert.equal(source.includes('select it in the “Extra vision models” dropdown under Advanced'), true)
+  // The hidden-models list is memoized so per-render catalog walks cannot
+  // regress the settings card's scroll smoothness.
+  assert.equal(source.includes('collectFilteredVisionBackends(catalog.groups, visionCaps.capabilities)'), true)
 })
